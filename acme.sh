@@ -34,6 +34,8 @@ _ZERO_EAB_ENDPOINT="http://api.zerossl.com/acme/eab-credentials-email"
 CA_SSLCOM_RSA="https://acme.ssl.com/sslcom-dv-rsa"
 CA_SSLCOM_ECC="https://acme.ssl.com/sslcom-dv-ecc"
 
+FARCRYPT_V1="https://farcrypt.localhost/api/acme"
+
 DEFAULT_CA=$CA_ZEROSSL
 DEFAULT_STAGING_CA=$CA_LETSENCRYPT_V2_TEST
 
@@ -70,6 +72,7 @@ NO_VALUE="no"
 
 W_DNS="dns"
 W_ALPN="alpn"
+W_FARCRYPT="farcrypt"
 DNS_ALIAS_PREFIX="="
 
 MODE_STATELESS="stateless"
@@ -87,6 +90,7 @@ BEGIN_CERT="-----BEGIN CERTIFICATE-----"
 END_CERT="-----END CERTIFICATE-----"
 
 CONTENT_TYPE_JSON="application/jose+json"
+CONTENT_TYPE_TEXT="text/plain"
 RENEW_SKIP=2
 
 B64CONF_START="__ACME_BASE64__START_"
@@ -177,6 +181,8 @@ _DNS_MANUAL_ERR="The dns manual mode can not renew automatically, you must issue
 _DNS_MANUAL_WARN="It seems that you are using dns manual mode. please take care: $_DNS_MANUAL_ERR"
 
 _DNS_MANUAL_ERROR="It seems that you are using dns manual mode. Read this link first: $_DNS_MANUAL_WIKI"
+
+_FARCRYPT=false
 
 __INTERACTIVE=""
 if [ -t 1 ]; then
@@ -3611,6 +3617,14 @@ _getAccountEmail() {
   _readaccountconf "ACCOUNT_EMAIL"
 }
 
+_getAccountFarcrypt() {
+  if [ "$ACCOUNT_FARCRYPT" ]; then
+    echo "$ACCOUNT_FARCRYPT"
+    return 0
+  fi
+  _readaccountconf "ACCOUNT_FARCRYPT"
+}
+
 #keylength
 _regAccount() {
   _initpath
@@ -3783,6 +3797,14 @@ updateaccount() {
     updjson='{"contact": ["mailto:'$_email'"]}'
   else
     updjson='{"contact": []}'
+  fi
+
+  _farcrypt="$(_getAccountFarcrypt)"
+
+  if [ "$ACCOUNT_FARCRYPT" ]; then
+    updjson='{"farcrypt": "'$_farcrypt'"}'
+  else
+    updjson='{"farcrypt": ""}'
   fi
 
   _send_signed_request "$_accUri" "$updjson"
@@ -4758,30 +4780,51 @@ $_authorizations_map"
 
         _debug wellknown_path "$wellknown_path"
 
-        _debug "writing token:$token to $wellknown_path/$token"
+        _farcrypt="$(_getAccountFarcrypt)"
 
-        mkdir -p "$wellknown_path"
+        if [ ! "$_farcrypt" ]; then
+          _debug "writing token:$token to $wellknown_path/$token"
 
-        if ! printf "%s" "$keyauthorization" >"$wellknown_path/$token"; then
-          _err "$d:Can not write token to file : $wellknown_path/$token"
-          _clearupwebbroot "$_currentRoot" "$removelevel" "$token"
-          _clearup
-          _on_issue_err "$_post_hook" "$vlist"
-          return 1
-        fi
+          mkdir -p "$wellknown_path"
 
-        if [ ! "$usingApache" ]; then
-          if webroot_owner=$(_stat "$_currentRoot"); then
-            _debug "Changing owner/group of .well-known to $webroot_owner"
-            if ! _exec "chown -R \"$webroot_owner\" \"$_currentRoot/.well-known\""; then
-              _debug "$(cat "$_EXEC_TEMP_ERR")"
-              _exec_err >/dev/null 2>&1
+          if ! printf "%s" "$keyauthorization" >"$wellknown_path/$token"; then
+            _err "$d:Can not write token to file : $wellknown_path/$token"
+            _clearupwebbroot "$_currentRoot" "$removelevel" "$token"
+            _clearup
+            _on_issue_err "$_post_hook" "$vlist"
+            return 1
+          fi
+
+          if [ ! "$usingApache" ]; then
+            if webroot_owner=$(_stat "$_currentRoot"); then
+              _debug "Changing owner/group of .well-known to $webroot_owner"
+              if ! _exec "chown -R \"$webroot_owner\" \"$_currentRoot/.well-known\""; then
+                _debug "$(cat "$_EXEC_TEMP_ERR")"
+                _exec_err >/dev/null 2>&1
+              fi
+            else
+              _debug "not changing owner/group of webroot"
             fi
-          else
-            _debug "not changing owner/group of webroot"
+          fi
+        else
+          url="$FARCRYPT_V1/$d/$token"
+          _debug "writing token:$_farcrypt to FarCrypt service $url"
+          _debug "body $keyauthorization"
+
+          response="$(_H1="Authorization: Bearer $_farcrypt" _post "$keyauthorization" "$url" "" "PUT" "$CONTENT_TYPE_TEXT")"
+          _debug2 response "$response"
+
+          responseHeaders="$(cat "$HTTP_HEADER")"
+          _debug2 responseHeaders "$responseHeaders"
+
+          code="$(grep "^HTTP" "$HTTP_HEADER" | _tail_n 1 | cut -d " " -f 2 | tr -d "\r\n")"
+          _debug code "$code"
+
+          if ! _startswith "$code" "2"; then
+              _err "Error writing to FarCrypt $url (bearer $_farcrypt)"
+              return 1
           fi
         fi
-
       fi
     elif [ "$vtype" = "$VTYPE_ALPN" ]; then
       acmevalidationv1="$(printf "%s" "$keyauthorization" | _digest "sha256" "hex")"
@@ -6259,6 +6302,7 @@ install() {
   _c_home="$2"
   _noprofile="$3"
   _accountemail="$4"
+  _account_farcrypt="$5"
 
   if ! _initpath; then
     _err "Install failed."
@@ -6380,6 +6424,10 @@ install() {
 
   if [ "$_accountemail" ]; then
     _saveaccountconf "ACCOUNT_EMAIL" "$_accountemail"
+  fi
+
+  if [ "$_account_farcrypt" ]; then
+    _saveaccountconf "ACCOUNT_FARCRYPT" "$_account_farcrypt"
   fi
 
   _info OK
@@ -6921,6 +6969,7 @@ _process() {
   _accountconf=""
   _useragent=""
   _accountemail=""
+  _account_farcrypt=""
   _accountkey=""
   _certhome=""
   _confighome=""
@@ -7252,6 +7301,19 @@ _process() {
       export ACCOUNT_EMAIL="$_accountemail"
       shift
       ;;
+    --farcrypt)
+      wvalue="$W_FARCRYPT"
+      if [ "$2" ] && ! _startswith "$2" "-"; then
+        _account_farcrypt="$2"
+        export ACCOUNT_FARCRYPT="$_account_farcrypt"
+        shift
+      fi
+      if [ -z "$_webroot" ]; then
+        _webroot="$wvalue"
+      else
+        _webroot="$_webroot,$wvalue"
+      fi
+      ;;
     --accountkey)
       _accountkey="$2"
       ACCOUNT_KEY_PATH="$_accountkey"
@@ -7453,6 +7515,9 @@ _process() {
       _preferred_chain="$2"
       shift
       ;;
+    --farcrypt)
+      _FARCRYPT=true
+      ;;
     *)
       _err "Unknown parameter : $1"
       return 1
@@ -7519,7 +7584,7 @@ _process() {
   fi
   _debug "Running cmd: ${_CMD}"
   case "${_CMD}" in
-  install) install "$_nocron" "$_confighome" "$_noprofile" "$_accountemail" ;;
+  install) install "$_nocron" "$_confighome" "$_noprofile" "$_accountemail" "$_account_farcrypt" ;;
   uninstall) uninstall "$_nocron" ;;
   upgrade) upgrade ;;
   issue)
